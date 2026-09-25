@@ -2,7 +2,7 @@
 
 基于 **Python 3.11 + FastAPI** 的干线（arterial）绿波发车窗口计算服务。
 
-提供五个接口：
+提供六个接口：
 
 1. **绿波发车窗口** `POST /api/green-wave/windows`：给定干线上至多 8 个路口各自的
    信号周期、相位偏移、周期内绿灯半开区间（允许跨周期零点）以及从起点到该路口的
@@ -35,6 +35,14 @@
    的**任意实际行驶时间**均遇绿。服务基于单车可行窗口**平移、求交并合并相邻区间**
    （中间车辆同样检查，不只验首末车），返回**全部极大半开首车发车区间**，按起点升序；
    无解时返回空数组 `[]`。
+6. **计划切换绿波窗口** `POST /api/green-wave/plan-switch-windows`：沿用绿波窗口接口的
+   发车范围、路口旧计划与行驶时间参数，另传全局整数秒 `switch_at` 与每个路口的
+   `next_plan`（`cycle`/`offset`/`green_start`/`green_end`，周期可与旧计划不同）。
+   车辆到达时刻**小于** `switch_at` 用旧计划、**等于或大于**用新计划判定灯色（绿灯仍按
+   半开及跨周期语义）；切换点落在抵达波动区间内时**两侧分别按各自计划检查**（不只按
+   最早或最晚抵达选定计划）。返回范围内**全部极大半开发车窗口**：每个整数秒出发、对
+   每个路口、`[travel, travel_max]` 内**任意实数**行驶时间下，按实际到达时刻适用的
+   计划均遇绿；无解时返回空数组 `[]`。
 
 ## 目录结构
 
@@ -98,6 +106,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 单路口 offset 诊断 | `POST http://localhost:8000/api/green-wave/offset-diagnostics` |
 | 整段时隙可调 offset | `POST http://localhost:8000/api/green-wave/slot-offsets` |
 | 车队首车发车窗口 | `POST http://localhost:8000/api/green-wave/convoy-starts` |
+| 计划切换绿波窗口 | `POST http://localhost:8000/api/green-wave/plan-switch-windows` |
 | 交互式文档（Swagger UI） | `http://localhost:8000/docs` |
 | OpenAPI 描述 | `http://localhost:8000/openapi.json` |
 
@@ -707,6 +716,124 @@ curl -s -X POST http://localhost:8000/api/green-wave/convoy-starts \
    `[depart_from, depart_to - (n-1)×headway)`，合并相邻（端点相接）区间，即得全部
    极大半开首车发车区间。全程只做区间平移与求交，不逐秒试探。
 
+## 计划切换绿波发车窗口
+
+`POST /api/green-wave/plan-switch-windows` 用于信号配时**整体切换**的场景：某个全局
+时刻 `switch_at` 之后，干线上所有路口启用新一套信号计划。请求沿用 `/windows` 的
+发车范围、路口旧计划与行驶时间参数（同样的 1..8 个路口与 422 校验规则），另传：
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `switch_at` | int | `>= 0`，全局计划切换时刻（整数秒）：车辆到达时刻**小于**它时按旧计划判定灯色，**等于或大于**时按 `next_plan` 判定 |
+| `intersections[].next_plan` | object | 必填，`switch_at` 及之后启用的新信号计划 |
+| `intersections[].next_plan.cycle` | int | `1..86400`，新计划周期，**可与旧计划不同** |
+| `intersections[].next_plan.offset` | int | `0 <= offset < next_plan.cycle` |
+| `intersections[].next_plan.green_start` | int | `0 <= green_start < next_plan.cycle` |
+| `intersections[].next_plan.green_end` | int | `0 <= green_end < next_plan.cycle`；与 `green_start` 相等表示整周期常绿 |
+
+判定规则：范围内每个整数秒出发、对每个路口、行驶时间取 `[travel, travel_max]` 内
+**任意实数**时，按**实际到达时刻**适用的计划（到达时刻 `< switch_at` 用旧计划，
+`>= switch_at` 用新计划）都必须遇绿；绿灯仍为半开区间、跨零点先连续化。当切换点
+落在抵达波动区间 `[t+travel, t+travel_max]` 内时，**两侧分别按各自计划检查**
+（前半段旧计划、后半段新计划均遇绿才可行），不能只按最早或最晚抵达选定计划。
+响应为**全部极大半开发车窗口** `[start, end)`（按起点升序），无解时返回空数组 `[]`。
+
+### 示例 1：切换点两侧绿灯相接，绿波带跨过切换时刻
+
+旧计划绿灯 `[0,30)`、新计划绿灯 `[30,50)`（周期均 60 秒），`switch_at=30`，
+行驶时间 `[0,10]`：旧计划绿灯终点恰与新计划绿灯起点在切换时刻相接，有效绿灯
+合并为连续时段 `[0,50)`，收缩 10 秒波动后窗口为 `[0,40)`——`t=25` 时抵达区间
+`[25,35]` 跨切换点，第 25..29 秒按旧计划、第 30..35 秒按新计划均遇绿：
+
+```bash
+curl -s -X POST http://localhost:8000/api/green-wave/plan-switch-windows \
+  -H "Content-Type: application/json" \
+  -d '{
+    "depart_from": 0,
+    "depart_to": 120,
+    "switch_at": 30,
+    "intersections": [
+      {"cycle": 60, "offset": 0, "green_start": 0, "green_end": 30,
+       "travel": 0, "travel_max": 10,
+       "next_plan": {"cycle": 60, "offset": 0, "green_start": 30, "green_end": 50}}
+    ]
+  }'
+```
+
+响应：
+
+```json
+[{"start": 0, "end": 40}, {"start": 90, "end": 100}]
+```
+
+### 示例 2：切换点落在抵达波动区间内，两侧都要检查
+
+新旧计划绿灯同为 `[0,30)`、`switch_at=30`、行驶时间 `[0,10]`：`t=25` 的抵达区间
+`[25,35]` 跨切换点，第 30..35 秒按新计划为红灯，故不可行——若只按最早（或最晚）
+抵达选定一套计划检查整个区间，会错误地接受或拒绝跨切换点的出发时刻：
+
+```bash
+curl -s -X POST http://localhost:8000/api/green-wave/plan-switch-windows \
+  -H "Content-Type: application/json" \
+  -d '{
+    "depart_from": 0,
+    "depart_to": 120,
+    "switch_at": 30,
+    "intersections": [
+      {"cycle": 60, "offset": 0, "green_start": 0, "green_end": 30,
+       "travel": 0, "travel_max": 10,
+       "next_plan": {"cycle": 60, "offset": 0, "green_start": 0, "green_end": 30}}
+    ]
+  }'
+```
+
+响应（切换点前后各自成窗，跨切换点的 10 秒被挖去）：
+
+```json
+[{"start": 0, "end": 20}, {"start": 60, "end": 80}]
+```
+
+### 示例 3：新计划可采用不同周期
+
+`switch_at=100`，旧计划周期 60 秒、绿灯 `[0,30)`，新计划周期 40 秒、绿灯
+`[0,20)`，无行驶波动，发车范围 `[90,150)`：切换后按 40 秒周期判定，仅
+`[120,140)` 内出发全程遇绿：
+
+```bash
+curl -s -X POST http://localhost:8000/api/green-wave/plan-switch-windows \
+  -H "Content-Type: application/json" \
+  -d '{
+    "depart_from": 90,
+    "depart_to": 150,
+    "switch_at": 100,
+    "intersections": [
+      {"cycle": 60, "offset": 0, "green_start": 0, "green_end": 30, "travel": 0,
+       "next_plan": {"cycle": 40, "offset": 0, "green_start": 0, "green_end": 20}}
+    ]
+  }'
+# [{"start":120,"end":140}]
+```
+
+无任何可行时刻时返回空数组 `[]`。
+
+### 计划切换的算法说明（有效绿灯合并 + 区间运算，不逐秒试探）
+
+1. **有效绿灯分量**：到达时间轴上的"有效绿灯"是 `(-∞, switch_at)` 内的旧计划
+   绿灯与 `[switch_at, +∞)` 内的新计划绿灯的并集。分别枚举两套计划在相关到达
+   范围内的连续绿灯分量（跨零点绿灯先连续化、常绿不收缩，与 `/windows` 一致），
+   旧计划分量右端截断到 `switch_at`、新计划分量左端截断到 `switch_at`；两侧恰在
+   `switch_at` 相接（旧分量终点 = 新分量起点 = `switch_at`）时**合并为一条连续
+   分量**——抵达波动区间跨切换点时，前半段按旧计划、后半段按新计划分别遇绿即
+   整体可行，不能只按最早或最晚抵达选定计划。
+2. **映射到出发时间轴**：每条有效绿灯分量 `[e_a, e_b)` 对应出发窗口
+   `[e_a - T, e_b - T_max)`（抵达闭区间 `[t+T, t+T_max]` 须整体落入分量内），
+   裁剪进发车范围并合并相邻（端点相接）区间。
+3. **多路口求交**：与 `/windows` 相同的双指针求交，得到全部极大半开发车窗口；
+   任一路口无可行窗口即返回空数组。
+
+复杂度与 `/windows` 同阶：每路口只枚举与到达范围（范围长度 + 波动量）相交的
+绿灯分量，不逐秒试探。
+
 ## 输入校验与错误
 
 无效周期、相位偏移、绿灯端点、行驶时间（含 `travel_max < travel` 或
@@ -746,6 +873,15 @@ curl -s -X POST http://localhost:8000/api/green-wave/convoy-starts \
 
 ```json
 { "detail": ["(vehicle_count - 1) × headway 必须小于发车范围长度"] }
+```
+
+`/api/green-wave/plan-switch-windows` 沿用绿波窗口接口的**全部** 422 校验（路口
+旧计划参数、发车范围长度等），并要求每个路口携带 `next_plan`、`switch_at` 为
+`>= 0` 的整数；`next_plan` 的 `offset` / `green_start` / `green_end` 以**其自身**
+`cycle` 为上界校验：
+
+```json
+{ "detail": ["next_plan.offset 必须满足 0 <= offset < cycle（路口 中山路）"] }
 ```
 
 ## 算法说明（区间运算，不逐秒试探）
@@ -792,4 +928,7 @@ pytest -q
 固定路口无法覆盖整段及等距建议取较小 offset 等边界；车队首车发车窗口
 另有 3000 组随机参数下与逐首车时刻 × 逐车暴力参考实现的逐项对照，并覆盖
 中间车辆被绿灯间隙卡住（不能只验首末车）、跨零点绿灯、行驶时间波动、
-首车范围裁剪与半开边界、常绿及无解等场景。
+首车范围裁剪与半开边界、常绿及无解等场景；计划切换绿波窗口
+另有 600 组随机参数下与逐秒 × 切换点分段判定参考实现的逐项对照，并覆盖
+切换点两侧绿灯相接合并、抵达波动区间跨切换点双侧检查、到达时刻恰为
+`switch_at` 时用新计划、新计划不同周期、跨零点绿灯、常绿及无解等场景。

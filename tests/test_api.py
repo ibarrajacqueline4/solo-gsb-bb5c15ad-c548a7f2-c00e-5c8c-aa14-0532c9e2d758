@@ -6,6 +6,7 @@ from app.main import (
     green_wave_convoy_starts,
     green_wave_max_coverage,
     green_wave_offset_diagnostics,
+    green_wave_plan_switch_windows,
     green_wave_slot_offsets,
     green_wave_windows,
 )
@@ -14,6 +15,7 @@ from app.schemas import (
     GreenWaveRequest,
     Intersection,
     OffsetDiagnosticsRequest,
+    PlanSwitchRequest,
     SlotOffsetsRequest,
 )
 
@@ -724,3 +726,167 @@ def test_convoy_route_is_in_openapi():
     paths = app.openapi()["paths"]
     assert "/api/green-wave/convoy-starts" in paths
     assert "post" in paths["/api/green-wave/convoy-starts"]
+
+
+# ---------- POST /api/green-wave/plan-switch-windows ----------
+
+def make_plan_switch_request(payload):
+    return PlanSwitchRequest.model_validate(payload)
+
+
+def plan_switch_payload(**overrides):
+    payload = {
+        "depart_from": 0,
+        "depart_to": 120,
+        "switch_at": 30,
+        "intersections": [
+            {
+                "cycle": 60, "offset": 0, "green_start": 0, "green_end": 30,
+                "travel": 0, "travel_max": 10,
+                "next_plan": {
+                    "cycle": 60, "offset": 0,
+                    "green_start": 30, "green_end": 50,
+                },
+            }
+        ],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_plan_switch_windows_payload_merge_across_switch():
+    # 旧计划绿灯 [0,30)、新计划 [30,50)，switch_at=30，行驶时间 [0,10]：
+    # 有效绿灯在切换点相接合并为连续分量 [0,50)，收缩 10 秒波动后为 [0,40)
+    req = make_plan_switch_request(plan_switch_payload())
+    windows = green_wave_plan_switch_windows(req)
+    assert [[w.start, w.end] for w in windows] == [[0, 40], [90, 100]]
+
+
+def test_plan_switch_pure_old_plan_when_switch_beyond_range():
+    req = make_plan_switch_request(
+        plan_switch_payload(
+            switch_at=100000,
+            intersections=[
+                {
+                    "cycle": 60, "offset": 0, "green_start": 0, "green_end": 30,
+                    "travel": 0,
+                    "next_plan": {
+                        "cycle": 60, "offset": 0,
+                        "green_start": 10, "green_end": 40,
+                    },
+                }
+            ],
+        )
+    )
+    windows = green_wave_plan_switch_windows(req)
+    assert [[w.start, w.end] for w in windows] == [[0, 30], [60, 90]]
+
+
+def test_plan_switch_empty_array_on_no_solution():
+    req = make_plan_switch_request(
+        plan_switch_payload(
+            depart_from=40,
+            depart_to=60,
+            switch_at=50,
+            intersections=[
+                {
+                    "cycle": 60, "offset": 0, "green_start": 0, "green_end": 10,
+                    "travel": 0,
+                    "next_plan": {
+                        "cycle": 60, "offset": 0,
+                        "green_start": 0, "green_end": 10,
+                    },
+                }
+            ],
+        )
+    )
+    assert green_wave_plan_switch_windows(req) == []
+
+
+def test_plan_switch_rejects_invalid_next_plan():
+    # next_plan 的 offset / green_start / green_end 以其自身 cycle 为上界
+    for bad_next_plan in (
+        {"cycle": 60, "offset": 60, "green_start": 0, "green_end": 30},
+        {"cycle": 60, "offset": 0, "green_start": 60, "green_end": 30},
+        {"cycle": 60, "offset": 0, "green_start": 0, "green_end": 60},
+    ):
+        req = make_plan_switch_request(
+            plan_switch_payload(
+                intersections=[
+                    {
+                        "cycle": 60, "offset": 0, "green_start": 0,
+                        "green_end": 30, "travel": 0,
+                        "next_plan": bad_next_plan,
+                    }
+                ],
+            )
+        )
+        with pytest.raises(HTTPException) as exc:
+            green_wave_plan_switch_windows(req)
+        assert exc.value.status_code == 422
+
+
+def test_plan_switch_requires_next_plan():
+    with pytest.raises(ValidationError):
+        make_plan_switch_request(
+            plan_switch_payload(
+                intersections=[
+                    {"cycle": 60, "offset": 0, "green_start": 0,
+                     "green_end": 30, "travel": 0}
+                ],
+            )
+        )
+
+
+def test_plan_switch_rejects_invalid_next_plan_cycle():
+    with pytest.raises(ValidationError):
+        make_plan_switch_request(
+            plan_switch_payload(
+                intersections=[
+                    {
+                        "cycle": 60, "offset": 0, "green_start": 0,
+                        "green_end": 30, "travel": 0,
+                        "next_plan": {"cycle": 0, "offset": 0,
+                                      "green_start": 0, "green_end": 30},
+                    }
+                ],
+            )
+        )
+
+
+def test_plan_switch_rejects_negative_switch_at():
+    with pytest.raises(ValidationError):
+        make_plan_switch_request(plan_switch_payload(switch_at=-1))
+
+
+def test_plan_switch_reuses_green_wave_validation():
+    # 与 /windows 相同的跨字段校验：发车范围超过 3600 秒、旧计划 offset
+    # 越界均返回 422。
+    req = make_plan_switch_request(plan_switch_payload(depart_to=3601))
+    with pytest.raises(HTTPException) as exc:
+        green_wave_plan_switch_windows(req)
+    assert exc.value.status_code == 422
+
+    req2 = make_plan_switch_request(
+        plan_switch_payload(
+            intersections=[
+                {
+                    "cycle": 60, "offset": 60, "green_start": 0,
+                    "green_end": 30, "travel": 0,
+                    "next_plan": {"cycle": 60, "offset": 0,
+                                  "green_start": 0, "green_end": 30},
+                }
+            ],
+        )
+    )
+    with pytest.raises(HTTPException) as exc:
+        green_wave_plan_switch_windows(req2)
+    assert exc.value.status_code == 422
+
+
+def test_plan_switch_route_is_in_openapi():
+    from app.main import app
+
+    paths = app.openapi()["paths"]
+    assert "/api/green-wave/plan-switch-windows" in paths
+    assert "post" in paths["/api/green-wave/plan-switch-windows"]

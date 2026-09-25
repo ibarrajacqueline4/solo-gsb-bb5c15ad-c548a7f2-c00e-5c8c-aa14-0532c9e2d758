@@ -69,6 +69,20 @@ offset 都可行；``L < n``（含 n >= C 而非常绿）时可行集为空。
 某辆车），再跨路口求交，最后裁剪进首车范围
 ``[depart_from, depart_to - (n-1)*h)`` 并合并相邻（端点相接）区间，即得
 全部极大半开首车发车区间。
+
+计划切换
+--------
+:func:`compute_plan_switch_windows` 沿用发车范围、路口旧计划与行驶时间参数，
+另传全局整数秒切换时刻 ``switch_at`` 与每个路口的 ``next_plan``（cycle /
+offset / green_start / green_end，周期可与旧计划不同；行驶时间参数沿用
+路口级设置）。到达时刻小于 ``switch_at`` 用旧计划、等于或大于用新计划判定
+灯色（绿灯仍按半开及跨周期语义）。把到达时间轴上的"有效绿灯"定义为
+``(-∞, switch_at)`` 内的旧计划绿灯与 ``[switch_at, +∞)`` 内的新计划绿灯的
+并集：两侧恰在切换点相接时合并为一条连续分量——切换点落在抵达波动区间
+``[t+T, t+T_max]`` 内时，前半段按旧计划、后半段按新计划分别遇绿即整体
+可行，不能只按最早或最晚抵达选定计划。每条连续有效绿灯分量
+``[e_a, e_b)`` 对应出发窗口 ``[e_a - T, e_b - T_max)``，裁剪进发车范围、
+合并相邻区间后再跨路口求交。全程只做区间运算，不逐秒试探。
 """
 
 from __future__ import annotations
@@ -641,3 +655,130 @@ def compute_slot_offsets(
         intervals, target["offset"], cycle
     )
     return intervals, recommended
+
+
+# ---------- 计划切换下的绿波发车窗口 ----------
+
+
+def _absolute_green_components(
+    cycle: int,
+    offset: int,
+    green_start: int,
+    green_end: int,
+    lo: int,
+    hi: int,
+) -> list[Interval]:
+    """绝对时间轴上与 [lo, hi) 相交的绿灯连续分量（半开区间，按起点升序）。
+
+    绝对时刻 t 的本地相位为 ``(t + offset) mod C``；跨零点绿灯先视为连续段
+    ``[green_start, C + green_end)``（不拆两段），故本地连续分量 ``[a, b)``
+    对应一列绝对分量 ``[kC + a - offset, kC + b - offset)``。整周期常绿时
+    返回 ``[[lo, hi]]``（调用方按关心范围给出 lo/hi，后续还会裁剪）。
+    """
+    if green_start == green_end:
+        return [[lo, hi]]
+    if green_start < green_end:
+        local_start, local_end = green_start, green_end
+    else:  # 跨零点：先连续化为 [green_start, C + green_end)
+        local_start, local_end = green_start, cycle + green_end
+    # 绝对分量 [kC + a - o, kC + b - o) 与 [lo, hi) 有非空交：
+    #   kC + b - o > lo  ⇔  k > (lo - b + o) / C
+    #   kC + a - o < hi  ⇔  k < (hi - a + o) / C
+    k_min = (lo - local_end + offset) // cycle + 1
+    k_max = -((-(hi - local_start + offset)) // cycle) - 1
+    components: list[Interval] = []
+    for k in range(k_min, k_max + 1):
+        base = k * cycle - offset
+        components.append([base + local_start, base + local_end])
+    return components
+
+
+def _plan_switch_windows_for_intersection(
+    item: dict,
+    switch_at: int,
+    depart_from: int,
+    depart_to: int,
+) -> list[Interval]:
+    """单路口在计划切换下的全部可行出发区间（已裁剪进发车范围并合并）。
+
+    ``item`` 为旧计划参数（cycle / offset / green_start / green_end /
+    travel / 可选 travel_max），``item["next_plan"]`` 为 switch_at 及之后
+    启用的新计划（周期可与旧计划不同）。到达时刻 < switch_at 用旧计划、
+    >= switch_at 用新计划；行驶时间取 [travel, travel_max] 内任意实数。
+    """
+    travel = item["travel"]
+    travel_max = item.get("travel_max")
+    if travel_max is None:
+        travel_max = travel
+    # 相关到达时刻范围：出发 t ∈ [depart_from, depart_to) 的抵达闭区间
+    # [t+T, t+T_max] 都含于 [arr_lo, arr_hi)（右端留一格余量）。
+    arr_lo = depart_from + travel
+    arr_hi = depart_to + travel_max
+
+    # 有效绿灯 = 旧计划绿灯在 switch_at 之前的部分 ∪ 新计划绿灯在
+    # switch_at 及之后的部分。两侧恰在 switch_at 相接时合并为一条连续
+    # 分量：抵达波动区间跨切换点时，前半段按旧计划、后半段按新计划分别
+    # 遇绿即整体可行（不能只按最早或最晚抵达选定计划）。
+    components: list[Interval] = []
+    for start, end in _absolute_green_components(
+        item["cycle"],
+        item["offset"],
+        item["green_start"],
+        item["green_end"],
+        arr_lo,
+        arr_hi,
+    ):
+        end = min(end, switch_at)
+        if start < end:
+            components.append([start, end])
+    next_plan = item["next_plan"]
+    for start, end in _absolute_green_components(
+        next_plan["cycle"],
+        next_plan["offset"],
+        next_plan["green_start"],
+        next_plan["green_end"],
+        arr_lo,
+        arr_hi,
+    ):
+        start = max(start, switch_at)
+        if start < end:
+            components.append([start, end])
+
+    windows: list[Interval] = []
+    for comp_start, comp_end in merge_intervals(components):
+        # 抵达闭区间 [t+T, t+T_max] 整体落入 [comp_start, comp_end)
+        # ⇔ 出发时刻 t ∈ [comp_start - T, comp_end - T_max)
+        start = comp_start - travel
+        end = comp_end - travel_max
+        if start < end:
+            windows.append([start, end])
+    return merge_intervals(clip_intervals(windows, depart_from, depart_to))
+
+
+def compute_plan_switch_windows(
+    intersections: Iterable[dict],
+    depart_from: int,
+    depart_to: int,
+    switch_at: int,
+) -> list[Interval]:
+    """计划切换下所有路口均遇绿灯的全部极大半开发车区间，按起点排序。
+
+    ``intersections`` 中每个字典含旧计划字段（与 :func:`compute_windows`
+    相同）及 ``next_plan`` 子字典（cycle / offset / green_start /
+    green_end）。到达时刻小于 ``switch_at`` 用旧计划、等于或大于用
+    ``next_plan``；对每个路口、``[travel, travel_max]`` 内任意实数行驶
+    时间，按实际到达时刻适用的计划均须遇绿。无任何可行时刻时返回空数组。
+    """
+    common: list[Interval] | None = None
+    for item in intersections:
+        windows = _plan_switch_windows_for_intersection(
+            item, switch_at, depart_from, depart_to
+        )
+        if common is None:
+            common = windows
+        else:
+            common = intersect_interval_lists(common, windows)
+        if not common:
+            return []
+    # 求交不会产生相接区间，最后再合并一次以策安全。
+    return merge_intervals(common or [])
