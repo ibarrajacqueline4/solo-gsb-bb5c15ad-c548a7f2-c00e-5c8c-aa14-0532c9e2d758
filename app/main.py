@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from .greenwave import (
     compute_convoy_starts,
     compute_max_coverage,
+    compute_plan_switch_windows,
     compute_slot_offsets,
     compute_windows,
     offset_diagnostics,
@@ -18,6 +19,7 @@ from .schemas import (
     OffsetDiagnosticsRequest,
     OffsetDiagnosticsResponse,
     OffsetInterval,
+    PlanSwitchRequest,
     SlotOffsetsRequest,
     SlotOffsetsResponse,
     Window,
@@ -51,9 +53,15 @@ app = FastAPI(
         "(vehicle_count-1)×headway 小于范围长度）。车队按固定间隔发车，"
         "每辆车都在给定范围内且在每个路口对任意实际行驶时间遇绿；基于单车"
         "可行窗口平移、求交并合并相邻区间（不只检查首末车），返回全部极大"
-        "半开首车发车区间，无解时返回空数组。"
+        "半开首车发车区间，无解时返回空数组。\n\n"
+        "计划切换接口 `POST /api/green-wave/plan-switch-windows`：复用路口"
+        "旧计划参数与发车范围，另传全局整数秒 switch_at，并为每个路口传 "
+        "next_plan（cycle、offset、green_start、green_end）。车辆到达时刻"
+        "严格小于 switch_at 用旧计划，等于或大于时用新计划；切换点落在"
+        "[travel, travel_max] 抵达波动区间内时两侧分别检查，不能只按最早"
+        "或最晚抵达选择计划。返回范围内全部极大半开发车窗口，无解返回空数组。"
     ),
-    version="1.4.0",
+    version="1.5.0",
 )
 
 
@@ -66,6 +74,19 @@ def _intersection_payload(item) -> dict:
         "green_end": item.green_end,
         "travel": item.travel,
         "travel_max": item.effective_travel_max,
+    }
+
+
+def _plan_switch_payload(item) -> dict:
+    """计划切换路口参数：旧计划字段之外另附 next_plan 新信号计划。"""
+    return {
+        **_intersection_payload(item),
+        "next_plan": {
+            "cycle": item.next_plan.cycle,
+            "offset": item.next_plan.offset,
+            "green_start": item.next_plan.green_start,
+            "green_end": item.next_plan.green_end,
+        },
     }
 
 
@@ -187,3 +208,22 @@ def green_wave_convoy_starts(request: ConvoyStartsRequest) -> list[Window]:
         headway=request.headway,
     )
     return [Window(start=start, end=end) for start, end in starts]
+
+
+@app.post(
+    "/api/green-wave/plan-switch-windows",
+    response_model=list[Window],
+    tags=["绿波"],
+    summary="计划在 switch_at 切换时的全部极大绿波发车窗口",
+)
+def green_wave_plan_switch_windows(request: PlanSwitchRequest) -> list[Window]:
+    request.validate_ranges()
+    windows = compute_plan_switch_windows(
+        intersections=[
+            _plan_switch_payload(item) for item in request.intersections
+        ],
+        depart_from=request.depart_from,
+        depart_to=request.depart_to,
+        switch_at=request.switch_at,
+    )
+    return [Window(start=start, end=end) for start, end in windows]

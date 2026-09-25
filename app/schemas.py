@@ -275,3 +275,87 @@ class ConvoyStartsRequest(GreenWaveRequest):
                     "(vehicle_count - 1) × headway 必须小于发车范围长度"
                 ],
             )
+
+
+class NextPlan(BaseModel):
+    """路口在 switch_at 之后启用的新信号计划（仅信号参数，行驶时间沿用旧值）。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    cycle: int = Field(
+        ..., ge=1, le=MAX_CYCLE, description="新计划信号周期 C'（秒），1..86400"
+    )
+    offset: int = Field(
+        ..., ge=0, description="新计划相位偏移 o'（秒），需满足 0 <= o' < C'"
+    )
+    green_start: int = Field(
+        ..., ge=0, description="新计划绿灯起点（本地相位秒），需满足 0 <= g_start < C'"
+    )
+    green_end: int = Field(
+        ..., ge=0, description="新计划绿灯终点（本地相位秒，不含），需满足 0 <= g_end < C'"
+    )
+
+    def validate_against_cycle(self, label: str) -> list[str]:
+        """校验相位与绿灯端点；返回中文错误信息列表（空列表表示合法）。"""
+        errors: list[str] = []
+        if not 0 <= self.offset < self.cycle:
+            errors.append(
+                f"next_plan.offset 必须满足 0 <= offset < cycle（路口 {label}）"
+            )
+        if not 0 <= self.green_start < self.cycle:
+            errors.append(
+                f"next_plan.green_start 必须满足 0 <= green_start < cycle（路口 {label}）"
+            )
+        if not 0 <= self.green_end < self.cycle:
+            errors.append(
+                f"next_plan.green_end 必须满足 0 <= green_end < cycle（路口 {label}）"
+            )
+        return errors
+
+
+class PlanSwitchIntersection(Intersection):
+    """带切换后新计划的路口：旧计划字段与普通路口完全一致。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    next_plan: NextPlan = Field(
+        ...,
+        description=(
+            "到达时刻 >= switch_at 时适用的新信号计划（cycle / offset / "
+            "green_start / green_end）；行驶时间 travel / travel_max 沿用旧值"
+        ),
+    )
+
+    def validate_against_cycle(self) -> None:
+        """旧计划校验沿用父类，并追加 next_plan 的相位上界校验。"""
+        errors: list[str] = []
+        try:
+            super().validate_against_cycle()
+        except HTTPException as exc:
+            detail = exc.detail
+            if isinstance(detail, list):
+                errors.extend(detail)
+            else:
+                errors.append(str(detail))
+        label = self.name or f"cycle={self.cycle}"
+        errors.extend(self.next_plan.validate_against_cycle(label))
+        if errors:
+            raise HTTPException(status_code=422, detail=errors)
+
+
+class PlanSwitchRequest(GreenWaveRequest):
+    """计划切换发车窗口请求：绿波请求基础上增加全局切换时刻与逐路口新计划。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    switch_at: int = Field(
+        ...,
+        description=(
+            "全局计划切换时刻 S（整数秒）：车辆到达时刻严格小于 S 用旧计划，"
+            "等于或大于 S 用新计划；可取任意整数（可为负或落在发车范围外）"
+        ),
+    )
+    intersections: list[PlanSwitchIntersection] = Field(
+        ..., min_length=1, max_length=MAX_INTERSECTIONS,
+        description="路口列表，1..8 个，每个路口均须携带 next_plan",
+    )

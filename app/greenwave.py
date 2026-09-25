@@ -69,6 +69,28 @@ offset 都可行；``L < n``（含 n >= C 而非常绿）时可行集为空。
 某辆车），再跨路口求交，最后裁剪进首车范围
 ``[depart_from, depart_to - (n-1)*h)`` 并合并相邻（端点相接）区间，即得
 全部极大半开首车发车区间。
+
+计划切换发车窗口
+----------------
+:func:`compute_plan_switch_windows` 在旧计划之外另给全局切换时刻 S
+（``switch_at``，整数秒）与每个路口的新计划（各自独立的 cycle / offset /
+green_start / green_end）。到达时刻严格小于 S 的部分按旧计划判灯，等于或
+大于 S 的部分按新计划判灯。按出发时刻 t 的抵达闭区间
+``[t+T, t+T_max]`` 与 S 的关系分三段：
+
+* ``t + T_max < S``（整段抵达都在切换前）：直接复用旧计划的收缩窗口；
+* ``t + T >= S``（整段抵达都在切换后）：直接复用新计划的收缩窗口；
+* ``t + T < S <= t + T_max``（切换点落在抵达波动区间内）：旧计划侧为
+  半开抵达段 ``[t+T, S)``、新计划侧为闭抵达段 ``[S, t+T_max]``，**两侧
+  必须分别**整体落入各自计划展开时间轴上的一条连续绿灯分量——不能只按最早
+  或最晚抵达选择计划。令 rho 为 S 沿绿灯方向距该计划（跨零点先连续化后的）
+  绿灯分量起点的秒数、L 为分量长度：旧侧半开段可行当且仅当常绿或
+  ``1 <= rho <= L``（rho=0 时 S 恰为绿灯起点、紧邻前方为红灯；rho=L 时
+  S 恰为分量右端不含，半开段仍可整体落入），给出 t 下界
+  ``S - T - rho``；新侧闭段可行当且仅当常绿或 ``0 <= rho < L``
+  （rho=L 时 S 恰为绿灯终点不含），给出 t 上界
+  ``S + L - rho - 1 - T_max``。混合整数段取交至多形成一条半开区间。三段
+  各自裁剪、合并后再跨路口求交。
 """
 
 from __future__ import annotations
@@ -641,3 +663,183 @@ def compute_slot_offsets(
         intervals, target["offset"], cycle
     )
     return intervals, recommended
+
+
+# ---------- 计划切换发车窗口 ----------
+
+
+def _switch_phase_position(
+    cycle: int,
+    green_start: int,
+    green_end: int,
+    switch_at: int,
+    offset: int,
+) -> tuple[bool, int, int]:
+    """切换时刻 S 在某计划绿灯周期结构中的位置。
+
+    返回 ``(always_green, rho, length)``：
+
+    * ``green_start == green_end``（整周期常绿）时返回
+      ``(True, 0, cycle)``；
+    * 否则跨零点绿灯先视为连续段（``[g_start, C) ∪ [0, g_end)`` 等价于
+      一条长度 ``L = (green_end - green_start) mod C`` 的连续分量），
+      ``rho = ((S + offset) mod C - green_start) mod C`` 即 S 沿绿灯方向
+      距分量起点的秒数，``length = L``。
+
+    旧计划侧（半开抵达段在 S 前结束）存在右端不早于 S 的连续绿灯分量，
+    当且仅当 ``1 <= rho <= L``；新计划侧（闭抵达段自 S 开始）存在覆盖 S
+    的连续绿灯分量，当且仅当 ``0 <= rho < L``。rho=0 时 S 恰为绿灯起点
+    （其紧邻前方是红灯），rho=L 时 S 恰为绿灯终点（不含）。
+    """
+    if green_start == green_end:
+        return True, 0, cycle
+    length = (green_end - green_start) % cycle
+    local_phase = (switch_at + offset) % cycle
+    rho = (local_phase - green_start) % cycle
+    return False, rho, length
+
+
+def compute_plan_switch_windows(
+    intersections: Iterable[dict],
+    depart_from: int,
+    depart_to: int,
+    switch_at: int,
+) -> list[Interval]:
+    """求计划在 ``switch_at`` 时刻切换时的全部极大半开发车区间。
+
+    每个路口字典沿用 cycle / offset / green_start / green_end / travel /
+    travel_max（缺省等于 travel）描述**旧计划**，另含 ``next_plan`` 字典
+    （cycle / offset / green_start / green_end）描述新计划。车辆到达时刻
+    严格小于 ``switch_at`` 时按旧计划判灯，等于或大于时按新计划判灯；
+    绿灯的半开与跨周期语义与 :func:`compute_windows` 完全一致。
+
+    对整数出发时刻 t，实际行驶时间可取闭区间 ``[T, T_max]`` 内任意实数，
+    抵达时刻覆盖闭区间 ``[t+T, t+T_max]``，分三种情形：
+
+    1. ``t + T_max < switch_at``：全部抵达都在切换前，t 落在旧计划的
+       收缩可行窗口内（复用 :func:`departure_windows_for_intersection`）；
+    2. ``t + T >= switch_at``：全部抵达都在切换后，t 落在新计划的收缩
+       可行窗口内；
+    3. ``t + T < switch_at <= t + T_max``：切换点落在抵达波动区间内，
+       旧计划侧半开段 ``[t+T, S)`` 与新计划侧闭段 ``[S, t+T_max]``
+       **分别**都必须整体落入各自计划展开时间轴上的一条连续绿灯分量
+       （不能只按最早或最晚抵达选择一侧）。令 rho 为 S 在该计划下沿绿灯
+       方向距（跨零点先连续化后的）绿灯分量起点的秒数、L 为该分量长度：
+       旧侧半开段可行当且仅当常绿或 ``1 <= rho <= L``（rho=0 时 S 恰为
+       绿灯起点、其紧邻前方是红灯），给出 t 下界 ``S - T - rho``；
+       新侧闭段可行当且仅当常绿或 ``0 <= rho < L``（rho=L 时 S 恰为绿灯
+       终点不含），给出 t 上界 ``S + L - rho - 1 - T_max``。混合整数段
+       为 ``t ∈ [S - T_max, S - T)``，与旧侧下界、新侧上界取交至多形成
+       一条半开整数区间。
+
+    三段结果裁剪进 ``[depart_from, depart_to)`` 合并后，跨路口两两求交，
+    即得全部极大半开发车区间；无解返回空数组。全程只做区间运算，不逐秒
+    试探。
+    """
+    common: list[Interval] | None = None
+    for item in intersections:
+        travel = item["travel"]
+        travel_max = item.get("travel_max")
+        if travel_max is None:
+            travel_max = travel
+        slack = travel_max - travel
+
+        old_windows = departure_windows_for_intersection(
+            cycle=item["cycle"],
+            offset=item["offset"],
+            green_start=item["green_start"],
+            green_end=item["green_end"],
+            travel=travel,
+            travel_max=travel_max,
+            depart_from=depart_from,
+            depart_to=depart_to,
+        )
+        nxt = item["next_plan"]
+        new_windows = departure_windows_for_intersection(
+            cycle=nxt["cycle"],
+            offset=nxt["offset"],
+            green_start=nxt["green_start"],
+            green_end=nxt["green_end"],
+            travel=travel,
+            travel_max=travel_max,
+            depart_from=depart_from,
+            depart_to=depart_to,
+        )
+
+        # 情形 1：t + T_max < S ⇔ 整数 t <= S - T_max - 1，半开上界 S-T_max。
+        old_only = clip_intervals(
+            old_windows, depart_from, switch_at - travel_max
+        )
+        # 情形 2：t + T >= S ⇔ 整数 t >= S - T（t+T=S 归新计划）。
+        new_only = clip_intervals(new_windows, switch_at - travel, depart_to)
+
+        # 情形 3：混合段，整数 t ∈ [S - T_max, S - T)。
+        mixed: list[Interval] = []
+        # slack == 0 时该整数区间为空（下界 == 上界），无需两侧分别检查。
+        if slack > 0:
+            # 旧计划侧：半开抵达段 [t+T, S) 须整体落入右端不早于 S 的一条
+            # 连续绿灯分量内（各计划按自身 offset 计算 S 的本地相位）。
+            old_always, old_rho, old_length = _switch_phase_position(
+                item["cycle"],
+                item["green_start"],
+                item["green_end"],
+                switch_at,
+                item["offset"],
+            )
+            # 新计划侧：闭抵达段 [S, t+T_max] 须整体落在覆盖 S 的一条连续
+            # 绿灯分量内。
+            new_always, new_rho, new_length = _switch_phase_position(
+                nxt["cycle"],
+                nxt["green_start"],
+                nxt["green_end"],
+                switch_at,
+                nxt["offset"],
+            )
+
+            lo = switch_at - travel_max
+            hi = switch_at - travel  # 半开 [lo, hi)
+
+            lower = lo
+            upper = hi - 1
+            feasible = True
+            if old_always:
+                pass  # 常绿：旧侧不增加约束
+            elif 1 <= old_rho <= old_length:
+                # 右端不早于 S 的旧分量左端点 a* = S - rho。半开抵达段
+                # [t+T, S) 整体落入该分量当且仅当 t + T >= a*
+                # ⇔ t >= S - T - rho（对 rho=L：S 恰为分量右端不含，
+                # [t+T, S) ⊂ [a*, S) 仍成立——到达最晚的实数时刻可任意
+                # 逼近 S）。
+                lower = max(lower, switch_at - travel - old_rho)
+            else:
+                # rho=0 时 S 恰为绿灯起点、其紧邻前方是红灯；rho>L 时 S 在
+                # 红灯段内：非空半开段 [t+T, S) 无法整体落入绿灯。
+                feasible = False
+            if new_always:
+                pass  # 常绿：新侧不增加约束
+            elif 0 <= new_rho < new_length:
+                # 覆盖 S 的分量右端点 b* = S + L - rho。闭抵达段
+                # [S, t+T_max] 整体落入 [a*, b*) 当且仅当 t + T_max < b*
+                # ⇔ t <= S + L - rho - 1 - T_max（闭右端必须严格小于 b*）。
+                upper = min(
+                    upper,
+                    switch_at + new_length - new_rho - 1 - travel_max,
+                )
+            else:
+                # rho=L 时 S 恰为绿灯终点（不含），否则 S 在红灯段内：
+                # 闭段 [S, t+T_max] 无法整体落入绿灯。
+                feasible = False
+
+            if feasible and lower <= upper:
+                mixed = [[lower, upper + 1]]
+
+        windows = merge_intervals(
+            clip_intervals(old_only + new_only + mixed, depart_from, depart_to)
+        )
+        if common is None:
+            common = windows
+        else:
+            common = intersect_interval_lists(common, windows)
+        if not common:
+            return []
+    return merge_intervals(common or [])
